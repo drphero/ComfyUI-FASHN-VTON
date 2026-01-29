@@ -4,7 +4,11 @@ This custom node set implements the [FASHN VTON v1.5](https://github.com/fashn-A
 
 ## Installation
 
-1.  Copy the `ComfyUI-FASHN-VTON` folder into your ComfyUI `custom_nodes` directory.
+**Via ComfyUI-Manager:**  
+Search for "ComfyUI-FASHN-VTON" in the manager and install it directly.
+
+**Manually:**
+1.  Clone this repo into `custom_nodes` folder.
 2.  Install the required dependencies:
     ```bash
     pip install -r requirements.txt
@@ -12,6 +16,8 @@ This custom node set implements the [FASHN VTON v1.5](https://github.com/fashn-A
     Note: If you are using a portable version of ComfyUI, use the corresponding python executable.
 
 ## How to Use
+
+<img width="980" height="496" alt="example" src="https://github.com/user-attachments/assets/b82241d9-4976-4a89-8922-b347c367a335" />
 
 ### 1. (Down)load FASHN VTON
 
