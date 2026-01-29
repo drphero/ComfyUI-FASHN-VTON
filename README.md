@@ -71,10 +71,6 @@ Use the **FASHN VTON Inference** node:
 - **guidance_scale**: Recommended 1.5–3.0.
 - **keep_model_loaded**: If set to `false`, the model will be moved to CPU after each inference to save VRAM.
 
-## Progress Bar
-
-The inference node supports the ComfyUI native progress bar to show the status of the sampling process.
-
 ## Credits
 
 Model by [FASHN AI](https://fashn.ai/). Implementation based on their open-source repository.
