@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-fashn-vton"
+version = "1.0.0"
+description = "Implements the FASHN VTON v1.5 model for virtual try-on in ComfyUI"
+readme = "README.md"
+license = {file = "LICENSE"}
+classifiers = []
+dependencies = []
+
+
+[project.urls]
+Repository = "https://github.com/drphero/ComfyUI-FASHN-VTON"
+
+
+[tool.comfy]
+PublisherId = "drphero"
+DisplayName = "ComfyUI-FASHN-VTON"
