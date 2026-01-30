@@ -70,9 +70,12 @@ class FashnVtonInference:
                 "pipeline": ("FASHN_VTON_PIPELINE",),
                 "person_image": ("IMAGE",),
                 "garment_image": ("IMAGE",),
-                "category": (["tops", "bottoms", "one-pieces"], {"default": "tops"}),
-                "num_timesteps": ("INT", {"default": 30, "min": 1, "max": 100, "step": 1}),
-                "guidance_scale": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 10.0, "step": 0.1}),
+                "garment_photo_type": (["model", "flat-lay"], {"default": "model", "tooltip": "'model' if garment is worn by a person, 'flat-lay' for product shots on plain backgrounds"}),
+                "category": (["tops", "bottoms", "one-pieces"], {"default": "tops", "tooltip": "Garment category - 'tops', 'bottoms', or 'one-pieces'"}),
+                "skip_cfg_last_n_steps": ("INT", {"default": 1, "tooltip": "Skip CFG for final N steps to prevent color saturation"}),
+                "segmentation_free": ("BOOLEAN", {"default": True, "tooltip": "If True, generate without masking the person image. Recommended for better body preservation and unconstrained garment volume (allows garments to expand beyond the original outfit's boundaries)"}),
+                "steps": ("INT", {"default": 30, "min": 1, "max": 100, "step": 1, "tooltip": "Recommended: 20 (fast), 30 (balanced), 50 (quality)"}),
+                "cfg": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 10.0, "step": 0.1}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "keep_model_loaded": ("BOOLEAN", {"default": True}),
             }
@@ -82,7 +85,7 @@ class FashnVtonInference:
     FUNCTION = "process"
     CATEGORY = "FashnAI"
 
-    def process(self, pipeline, person_image, garment_image, category, num_timesteps, guidance_scale, seed, keep_model_loaded):
+    def process(self, pipeline, person_image, garment_image, garment_photo_type, category, skip_cfg_last_n_steps, segmentation_free, steps, cfg, seed, keep_model_loaded):
         
         device = comfy.model_management.get_torch_device()
         
@@ -114,8 +117,11 @@ class FashnVtonInference:
                 person_image=person_pil,
                 garment_image=garment_pil,
                 category=category,
-                num_timesteps=num_timesteps,
-                guidance_scale=guidance_scale,
+                garment_photo_type=garment_photo_type,
+                segmentation_free=segmentation_free,
+                skip_cfg_last_n_steps=skip_cfg_last_n_steps,
+                num_timesteps=steps,
+                guidance_scale=cfg,
                 seed=seed,
                 callback=progress_callback,
             )
