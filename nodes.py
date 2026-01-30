@@ -95,8 +95,9 @@ class FashnVtonInference:
         if hasattr(pipeline, "hp_model"):
             if hasattr(pipeline.hp_model, "model"):
                 pipeline.hp_model.model.to(device)
+            pipeline.hp_model.device = device
 
-        pbar = comfy.utils.ProgressBar(num_timesteps)
+        pbar = comfy.utils.ProgressBar(steps)
         
         def progress_callback(step, total_steps):
             pbar.update_absolute(step + 1, total_steps)
@@ -135,6 +136,9 @@ class FashnVtonInference:
                 if hasattr(pipeline, "hp_model"):
                     if hasattr(pipeline.hp_model, "model"):
                         pipeline.hp_model.model.to("cpu")
+                    pipeline.hp_model.device = device
+                if hasattr(pipeline, "pose_model"):
+                    del pipeline.pose_model
                 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
