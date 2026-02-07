@@ -3,7 +3,7 @@
 import logging
 import os
 from dataclasses import dataclass
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -14,7 +14,6 @@ from tqdm.auto import tqdm
 
 import comfy.model_management
 
-from .dwpose import DWposeDetector, draw_pose
 from .preprocessing import (
     BODY_COVERAGE_TO_FASHN_LABELS,
     FASHN_LABELS_TO_IDS,
@@ -23,6 +22,8 @@ from .preprocessing import (
     create_clothing_agnostic_image,
     create_garment_image,
 )
+from .pose_keypoints import convert_pose_keypoints_to_dwpose
+from .providers import DWPoseProvider, FashnHumanParserProvider
 from .tryon_mmdit import TryOnModel
 from .utils import (
     get_dummy_dw_keypoints,
@@ -48,7 +49,6 @@ class TryOnPipeline:
 
     Args:
         weights_dir: Directory containing model weights (model.safetensors, dwpose/)
-        device: Device to run on ('cuda', 'cpu', or None for auto-detect)
         logger: Optional logger instance
 
     Example:
@@ -57,6 +57,13 @@ class TryOnPipeline:
     """
 
     CATEGORY_TO_LABEL = {"tops": 1, "bottoms": 2, "one-pieces": 3}
+    POSE_SOURCES = (
+        "auto",
+        "internal_dwpose",
+        "external_pose_keypoints",
+    )
+    PARSER_BACKENDS = ("fashn_human_parser", "external_fashn_labelmap")
+    MAX_FASHN_LABEL_ID = max(FASHN_LABELS_TO_IDS.values())
 
     def __init__(
         self,
@@ -69,7 +76,6 @@ class TryOnPipeline:
         # Setup device
         self.offload_device = torch.device("cpu")
         self.device = comfy.model_management.get_torch_device()
-
 
         # Setup inference dtype
         self.inference_dtype = torch.float32
@@ -85,6 +91,9 @@ class TryOnPipeline:
         # Load models
         self._setup_tryon_model()
         self._setup_hp_model()
+
+        # Lazily loaded providers
+        self.pose_provider: Optional[DWPoseProvider] = None
 
         # Setup transforms (derived from model input shape)
         h, w = self.tryon_model.input_shape
@@ -126,14 +135,16 @@ class TryOnPipeline:
 
         self.logger.info("TryOnModel loaded")
 
-    def _get_dwpose_detector(self):
-        """
-        Helper to init ONNX model on the fly.
-        ONNX sessions are hard to move, so we create it when needed.
-        """
-        dwpose_dir = os.path.join(self.weights_dir, "dwpose")
-        dwpose_device = f"cuda:{self.device.index or 0}" if self.device.type == "cuda" else "cpu"
-        return DWposeDetector(checkpoints_dir=dwpose_dir, device=dwpose_device)
+    def _get_pose_provider(self) -> DWPoseProvider:
+        """Create DWPose provider lazily so external-pose workflows can skip it."""
+        if self.pose_provider is None:
+            dwpose_dir = os.path.join(self.weights_dir, "dwpose")
+            dwpose_device = f"cuda:{self.device.index or 0}" if self.device.type == "cuda" else "cpu"
+            self.pose_provider = DWPoseProvider(checkpoints_dir=dwpose_dir, device=dwpose_device)
+            # Backward-compatible attribute used by existing unload logic.
+            self.pose_model = self.pose_provider.detector
+
+        return self.pose_provider
 
     def _setup_hp_model(self):
         """Load human parsing model."""
@@ -143,9 +154,194 @@ class TryOnPipeline:
 
         if hasattr(self.hp_model, "model"):
             self.hp_model.model.to(self.offload_device)
-        
+
         self.hp_model.device = self.offload_device
+        self.parser_provider = FashnHumanParserProvider(self.hp_model)
         self.logger.info(f"FashnHumanParser loaded on {self.offload_device}")
+
+    def _normalize_external_pose_keypoints(self, pose_keypoints: Optional[dict]) -> Optional[dict]:
+        """Convert arbitrary keypoint payload to canonical DWPose-style dict."""
+        if pose_keypoints is None:
+            return None
+
+        converted = convert_pose_keypoints_to_dwpose(pose_keypoints, single_person=True)
+        if converted is None:
+            self.logger.warning("External pose keypoints payload is unsupported. Falling back to other pose sources.")
+            return None
+        return converted
+
+    def _normalize_external_segmentation(
+        self, seg_img: Optional[Image.Image], image_name: str
+    ) -> Optional[np.ndarray]:
+        """Convert external segmentation image to uint8 label-id map."""
+        if seg_img is None:
+            return None
+
+        seg_np = np.array(seg_img)
+
+        if seg_np.ndim == 3:
+            if seg_np.shape[2] == 1:
+                seg_np = seg_np[..., 0]
+            else:
+                if not (
+                    np.array_equal(seg_np[..., 0], seg_np[..., 1])
+                    and np.array_equal(seg_np[..., 0], seg_np[..., 2])
+                ):
+                    self.logger.warning(
+                        "%s segmentation has non-identical RGB channels. Using channel 0 as label ids.",
+                        image_name,
+                    )
+                seg_np = seg_np[..., 0]
+        elif seg_np.ndim != 2:
+            self.logger.warning(
+                "%s segmentation has invalid rank %s. Falling back to internal parser.",
+                image_name,
+                seg_np.ndim,
+            )
+            return None
+
+        seg_np = seg_np.astype(np.uint8)
+
+        if np.any(seg_np > self.MAX_FASHN_LABEL_ID):
+            self.logger.warning(
+                "%s segmentation contains label ids > %s. Falling back to internal parser.",
+                image_name,
+                self.MAX_FASHN_LABEL_ID,
+            )
+            return None
+
+        return seg_np
+
+    def _detect_internal_pose_image(self, image_np: np.ndarray) -> np.ndarray:
+        """Detect and render internal DWPose grayscale map."""
+        pose_provider = self._get_pose_provider()
+        pose = pose_provider.detect(image_np)
+        return pose_provider.render_grayscale(pose, image_np.shape[0], image_np.shape[1])
+
+    def _render_pose_keypoints(self, pose_keypoints: dict, height: int, width: int) -> Optional[np.ndarray]:
+        """Render normalized DWPose-style keypoints into grayscale pose map."""
+        try:
+            pose_provider = self._get_pose_provider()
+            return pose_provider.render_grayscale(pose_keypoints, height, width)
+        except Exception as exc:
+            self.logger.warning("Failed to render external keypoints (%s). Falling back to other pose sources.", exc)
+            return None
+
+    def _render_dummy_pose_image(self, height: int, width: int) -> np.ndarray:
+        """Render dummy pose map used for flat-lay garment images."""
+        pose_provider = self._get_pose_provider()
+        dummy_pose = get_dummy_dw_keypoints()
+        return pose_provider.render_grayscale(dummy_pose, height, width)
+
+    def _get_pose_images(
+        self,
+        *,
+        person_image_np: np.ndarray,
+        garment_image_np: np.ndarray,
+        garment_photo_type: str,
+        pose_source: str,
+        person_pose_keypoints: Optional[dict],
+        garment_pose_keypoints: Optional[dict],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Resolve pose maps from external inputs or internal DWPose."""
+        if pose_source not in self.POSE_SOURCES:
+            self.logger.warning("Unknown pose_source=%s. Using auto.", pose_source)
+            pose_source = "auto"
+
+        use_external_keypoints = pose_source in ("auto", "external_pose_keypoints")
+
+        person_pose_img = None
+        garment_pose_img = None
+        person_pose_source = "internal_dwpose"
+        garment_pose_source = "internal_dwpose"
+
+        if use_external_keypoints:
+            person_keypoints = self._normalize_external_pose_keypoints(person_pose_keypoints)
+            garment_keypoints = self._normalize_external_pose_keypoints(garment_pose_keypoints)
+
+            if person_keypoints is not None:
+                person_pose_img = self._render_pose_keypoints(
+                    person_keypoints,
+                    person_image_np.shape[0],
+                    person_image_np.shape[1],
+                )
+                if person_pose_img is not None:
+                    person_pose_source = "external_keypoints"
+
+            if garment_keypoints is not None:
+                garment_pose_img = self._render_pose_keypoints(
+                    garment_keypoints,
+                    garment_image_np.shape[0],
+                    garment_image_np.shape[1],
+                )
+                if garment_pose_img is not None:
+                    garment_pose_source = "external_keypoints"
+
+        if person_pose_img is None:
+            person_pose_img = self._detect_internal_pose_image(person_image_np)
+            if use_external_keypoints:
+                person_pose_source = "internal_fallback"
+
+        if garment_pose_img is None:
+            if garment_photo_type == "flat-lay":
+                garment_pose_img = self._render_dummy_pose_image(garment_image_np.shape[0], garment_image_np.shape[1])
+                garment_pose_source = "dummy_flat_lay"
+            else:
+                garment_pose_img = self._detect_internal_pose_image(garment_image_np)
+                if use_external_keypoints:
+                    garment_pose_source = "internal_fallback"
+
+        self.logger.info(
+            "pose_source_resolved person=%s garment=%s",
+            person_pose_source,
+            garment_pose_source,
+        )
+
+        return person_pose_img, garment_pose_img
+
+    def _get_segmentation_maps(
+        self,
+        *,
+        person_image_np: np.ndarray,
+        garment_image_np: np.ndarray,
+        parser_backend: str,
+        person_segmentation_image: Optional[Image.Image],
+        garment_segmentation_image: Optional[Image.Image],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Resolve segmentation maps from selected backend with fallback."""
+        if parser_backend not in self.PARSER_BACKENDS:
+            self.logger.warning("Unknown parser_backend=%s. Using fashn_human_parser.", parser_backend)
+            parser_backend = "fashn_human_parser"
+
+        person_source = "internal"
+        garment_source = "internal"
+
+        if parser_backend == "external_fashn_labelmap":
+            person_seg_pred = self._normalize_external_segmentation(person_segmentation_image, "person")
+            garment_seg_pred = self._normalize_external_segmentation(garment_segmentation_image, "garment")
+
+            if person_seg_pred is None:
+                person_seg_pred = self.parser_provider.predict(person_image_np)
+                person_source = "internal_fallback"
+            else:
+                person_source = "external"
+
+            if garment_seg_pred is None:
+                garment_seg_pred = self.parser_provider.predict(garment_image_np)
+                garment_source = "internal_fallback"
+            else:
+                garment_source = "external"
+        else:
+            person_seg_pred = self.parser_provider.predict(person_image_np)
+            garment_seg_pred = self.parser_provider.predict(garment_image_np)
+
+        self.logger.info(
+            "parser_backend_resolved person=%s garment=%s",
+            person_source,
+            garment_source,
+        )
+
+        return person_seg_pred, garment_seg_pred
 
     @torch.inference_mode()
     def _sample(
@@ -224,6 +420,12 @@ class TryOnPipeline:
         skip_cfg_last_n_steps: int = 1,
         seed: int = 42,
         segmentation_free: bool = True,
+        pose_source: Literal["auto", "internal_dwpose", "external_pose_keypoints"] = "auto",
+        person_pose_keypoints: Optional[dict] = None,
+        garment_pose_keypoints: Optional[dict] = None,
+        parser_backend: Literal["fashn_human_parser", "external_fashn_labelmap"] = "fashn_human_parser",
+        person_segmentation_image: Optional[Image.Image] = None,
+        garment_segmentation_image: Optional[Image.Image] = None,
         callback: Optional[callable] = None,
     ) -> PipelineOutput:
         """
@@ -237,19 +439,20 @@ class TryOnPipeline:
                 "flat-lay" for product shots on plain backgrounds.
             num_samples: Number of output images to generate (1-4).
             num_timesteps: Diffusion sampling steps. Higher = better quality, slower.
-                Recommended: 20 (fast), 30 (balanced), 50 (quality).
             guidance_scale: Classifier-free guidance strength.
             skip_cfg_last_n_steps: Skip CFG for final N steps to prevent color saturation.
             seed: Random seed for reproducibility.
             segmentation_free: If True, generate without masking the person image.
-                Recommended for better body preservation and unconstrained garment volume
-                (allows garments to expand beyond the original outfit's boundaries).
+            pose_source: Pose source routing strategy.
+            person_pose_keypoints: Optional external keypoints payload for person.
+            garment_pose_keypoints: Optional external keypoints payload for garment.
+            parser_backend: Parser backend strategy.
+            person_segmentation_image: Optional external person segmentation map.
+            garment_segmentation_image: Optional external garment segmentation map.
 
         Returns:
             PipelineOutput with `images` list containing generated PIL Images.
         """
-
-        self.pose_model = self._get_dwpose_detector()
 
         # Set seed
         torch.manual_seed(seed)
@@ -257,27 +460,39 @@ class TryOnPipeline:
             torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
 
-        # Pre-resize for pose detection quality
+        # Pre-resize for detection/parsing quality
         person_image = self.pre_resize(person_image, allow_upsampling=False)
         garment_image = self.pre_resize(garment_image, allow_upsampling=False)
+        nearest_resample = Image.Resampling if hasattr(Image, "Resampling") else Image
+
+        if person_segmentation_image is not None:
+            person_segmentation_image = self.pre_resize(
+                person_segmentation_image, allow_upsampling=False, interpolation=nearest_resample.NEAREST
+            )
+        if garment_segmentation_image is not None:
+            garment_segmentation_image = self.pre_resize(
+                garment_segmentation_image, allow_upsampling=False, interpolation=nearest_resample.NEAREST
+            )
 
         person_image_np = np.array(person_image)
         garment_image_np = np.array(garment_image)
 
-        # Pose detection (DWPose expects BGR)
-        person_pose = self.pose_model(person_image_np[..., ::-1])
-        garment_pose = (
-            get_dummy_dw_keypoints()
-            if garment_photo_type == "flat-lay"
-            else self.pose_model(garment_image_np[..., ::-1])
+        person_pose_img, garment_pose_img = self._get_pose_images(
+            person_image_np=person_image_np,
+            garment_image_np=garment_image_np,
+            garment_photo_type=garment_photo_type,
+            pose_source=pose_source,
+            person_pose_keypoints=person_pose_keypoints,
+            garment_pose_keypoints=garment_pose_keypoints,
         )
 
-        person_pose_img = draw_pose(person_pose, person_image_np.shape[0], person_image_np.shape[1], grayscale=True)
-        garment_pose_img = draw_pose(garment_pose, garment_image_np.shape[0], garment_image_np.shape[1], grayscale=True)
-
-        # Human parsing
-        person_seg_pred = self.hp_model.predict(person_image_np)
-        garment_seg_pred = self.hp_model.predict(garment_image_np)
+        person_seg_pred, garment_seg_pred = self._get_segmentation_maps(
+            person_image_np=person_image_np,
+            garment_image_np=garment_image_np,
+            parser_backend=parser_backend,
+            person_segmentation_image=person_segmentation_image,
+            garment_segmentation_image=garment_segmentation_image,
+        )
 
         # Get labels to segment based on category
         body_coverage = CATEGORY_TO_BODY_COVERAGE.get(category)
