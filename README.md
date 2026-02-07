@@ -71,6 +71,45 @@ Use the **FASHN VTON Inference** node:
 - **guidance_scale**: Recommended 1.5–3.0.
 - **keep_model_loaded**: If set to `false`, the model will be moved to CPU after each inference to save VRAM.
 
+Existing workflows remain valid. If you do not connect new optional inputs, behavior stays the same as before.
+
+New optional controls:
+- **pose_source**:
+  - `auto` (default): use external keypoints if connected, otherwise internal DWPose
+  - `internal_dwpose`: always use built-in DWPose
+  - `external_pose_keypoints`: prefer external keypoints payloads
+- **person_pose_keypoints / garment_pose_keypoints** (optional): keypoint payloads converted by **Fashn Pose Keypoints Adapter**.
+- **parser_backend**:
+  - `fashn_human_parser` (default)
+  - `external_fashn_labelmap` (uses external segmentation maps encoded with FASHN label IDs)
+- **person_segmentation_image / garment_segmentation_image** (optional): external segmentation maps.
+
+Fallback behavior:
+- If external keypoint payloads are missing/invalid, inference falls back to internal DWPose.
+- For `flat-lay` garments without external garment pose, the pipeline uses the built-in dummy garment pose.
+- If external segmentation maps are missing/invalid, inference falls back to `fashn_human_parser`.
+
+### 3. Adapter Nodes
+
+Two utility nodes are included to make third-party node outputs easier to connect:
+- **Fashn Pose Keypoints Adapter**:
+  - Converts `POSE_KEYPOINT` payloads into internal DWPose-style keypoints.
+  - Supports single-person selection to match internal DWPose behavior.
+- **Fashn Mask to Labelmap**:
+  - Converts a single merged mask into a valid FASHN labelmap image.
+  - Uses category defaults (`tops->top`, `bottoms->pants`, `one-pieces->dress`) with optional label ID override.
+
+Typical external keypoint workflow (closest match to internal rendering):
+1. Third-party DWPose/OpenPose node -> **Fashn Pose Keypoints Adapter**
+2. Connect adapter output to `person_pose_keypoints` (and/or `garment_pose_keypoints`)
+3. Set **pose_source** to `auto` or `external_pose_keypoints`
+
+Typical external garment-mask workflow:
+1. Third-party segmentation node -> merged garment mask
+2. Mask -> **Fashn Mask to Labelmap** (choose category, optionally override label ID)
+3. Connect output to `garment_segmentation_image`
+4. Set `parser_backend=external_fashn_labelmap`
+
 ## Credits
 
 Model by [FASHN AI](https://fashn.ai/). Implementation based on their open-source repository.
